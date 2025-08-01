@@ -12,11 +12,13 @@ import numpy as np
 from model.decorate import *
 import math
 import pandas as pd
-import matlab.engine
+from PostProcess.g2p.align_py import align_fp_py
+
+# import matlab.engine # No longer needed
 
 global test_data, test_data_topk, testNameList, trainNameList
 global train_data, trainNameList, trainTF, train_data_eNum, train_data_rNum
-global engview, model
+global model # engview removed
 global tf_train, centroids, clusters
 
 
@@ -28,22 +30,22 @@ def Init(request):
     start = time.clock()
     getTestData()
     getTrainData()
-    loadMatlabEng()
+    # loadMatlabEng() # No longer needed
     loadModel()
     loadRetrieval()
     end = time.clock()
-    print('Init(model+test+train+engine+retrieval) time: %s Seconds' % (end - start))
+    print('Init(model+test+train+retrieval) time: %s Seconds' % (end - start))
 
     return HttpResponse(None)
 
 
-def loadMatlabEng():
-    startengview = time.clock()
-    global engview
-    engview = matlab.engine.start_matlab()
-    engview.addpath(r'./align_fp/', nargout=0)
-    endengview = time.clock()
-    print(' matlab.engineview time: %s Seconds' % (endengview - startengview))
+# def loadMatlabEng():
+#     startengview = time.clock()
+#     global engview
+#     engview = matlab.engine.start_matlab()
+#     engview.addpath(r'./align_fp/', nargout=0)
+#     endengview = time.clock()
+#     print(' matlab.engineview time: %s Seconds' % (endengview - startengview))
 
 
 def loadRetrieval():
@@ -577,19 +579,25 @@ def Save_Editbox(request):
     rEdge = fp_end.get_triples(tensor=False)[:, [0, 2, 1]]
     Edge = [[float(u), float(v), float(type2)] for u, v, type2 in rEdge]
     Box=NewLay
-    boundary_mat = matlab.double(boundary)
-    rType_mat = matlab.double(rType.tolist())
-    Edge_mat = matlab.double(Edge)
-    Box_mat=matlab.double(Box)
-    fp_end.data.boundary =np.array(boundary)
-    fp_end.data.rType =np.array(rType).astype(int)
-    fp_end.data.refineBox=np.array(Box)
-    fp_end.data.rEdge=np.array(Edge)
+    fp_end.data.boundary = np.array(boundary)
+    fp_end.data.rType = np.array(rType).astype(int)
+    fp_end.data.refineBox = np.array(Box)
+    fp_end.data.rEdge = np.array(Edge)
 
-    box_refine = engview.align_fp(boundary_mat, Box_mat,  rType_mat,Edge_mat ,18,False, nargout=3)
-    box_out=box_refine[0]
-    box_order=box_refine[1]
-    rBoundary=box_refine[2]
+    # Call the new Python-native alignment function
+    # The MATLAB call is no longer needed:
+    # box_refine = engview.align_fp(boundary_mat, Box_mat,  rType_mat,Edge_mat ,18,False, nargout=3)
+    box_out, box_order, rBoundary = align_fp_py(
+        boundary=fp_end.data.boundary,
+        r_box=fp_end.data.refineBox,
+        r_type=fp_end.data.rType,
+        r_edge=fp_end.data.rEdge,
+        fp_layout=None,  # This argument is a placeholder in the ported function
+        threshold=18
+    )
+    # The MATLAB version returns order as 1-based, our Python version is 0-based.
+    # The original MATLAB code also does a reshape and -1, so we need to be careful.
+    # Our Python version already returns a 0-based flat array, so no extra processing is needed.
     fp_end.data.newBox = np.array(box_out)
     fp_end.data.order = np.array(box_order)
     fp_end.data.rBoundary = [np.array(rb) for rb in rBoundary]

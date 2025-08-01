@@ -219,236 +219,260 @@ def mutex_loss(boxes,step=2):
     return (f_b_dist*f_out_box).sum()/(B*FP-B)
 
 class InsideLoss(nn.Module):
-    def __init__(self,nsample=100,cuda=True):
-        super(InsideLoss,self).__init__()
-        self.bstep = round(nsample/4)
+    def __init__(self, nsample=100):
+        super(InsideLoss, self).__init__()
+        self.bstep = round(nsample / 4)
         self.fstep = round(math.sqrt(nsample))
-        self.BP = self.bstep*4
-        self.FP = self.fstep*self.fstep
-        self.boundary = sample_boundary(step=self.bstep).view(1,self.BP,2)
-        self.fragment = sample_fragment(step=self.fstep).view(1,self.FP,2)
-        
-        if cuda:
-            self.boundary=self.boundary.cuda()
-            self.fragment=self.fragment.cuda()
+        self.BP = self.bstep * 4
+        self.FP = self.fstep * self.fstep
+        self.boundary = sample_boundary(step=self.bstep).view(1, self.BP, 2)
+        self.fragment = sample_fragment(step=self.fstep).view(1, self.FP, 2)
 
-    def _inside_loss(self,boxes,fragment_boxes):
+    def _inside_loss(self, boxes, fragment_boxes):
         B, _ = boxes.shape
         F, _ = fragment_boxes.shape
-        box_wh=boxes[:,2:]-boxes[:,:2]
-        fragment_wh = fragment_boxes[:,2:]-fragment_boxes[:,:2]
+        box_wh = boxes[:, 2:] - boxes[:, :2]
+        fragment_wh = fragment_boxes[:, 2:] - fragment_boxes[:, :2]
+
+        # Move internal tensors to the correct device
+        boundary = self.boundary.to(boxes.device)
+        fragment = self.fragment.to(boxes.device)
 
         # [B,FP,2]
-        box_fragments = self.fragment*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_fragments = fragment * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
         # [F,BP,2]
-        fragment_boundaries = self.boundary*fragment_wh.view(F,1,2)+fragment_boxes[:,:2].view(F,1,2)
+        fragment_boundaries = boundary * fragment_wh.view(F, 1, 2) + fragment_boxes[:, :2].view(F, 1, 2)
         # [B,FP,F]
-        f_out_box = fragment_outside_box(box_fragments,fragment_boxes)
+        f_out_box = fragment_outside_box(box_fragments, fragment_boxes)
         # [B,FP,F]
-        f_b_dist = fragment_box_distance(box_fragments,fragment_boundaries)
+        f_b_dist = fragment_box_distance(box_fragments, fragment_boundaries)
         # [B,FP]
-        return (f_b_dist*f_out_box).sum()/(B*self.FP)   
+        return (f_b_dist * f_out_box).sum() / (B * self.FP)
 
-    def test(self,boxes,fragment_boxes):
+    def test(self, boxes, fragment_boxes):
         with torch.no_grad():
-            return self._inside_loss(boxes,fragment_boxes)
+            return self._inside_loss(boxes, fragment_boxes)
 
-    def forward(self,boxes,fragment_boxes,obj_to_img,reduction="mean"):
-        N = obj_to_img.data.max().item() + 1
+    def forward(self, boxes, fragment_boxes, obj_to_img, reduction="mean"):
+        if obj_to_img.numel() == 0:
+            return torch.tensor(0.0, device=boxes.device)
+        N = obj_to_img.max().item() + 1
         boxes = box_utils.centers_to_extents(boxes)
 
         losses = []
         for i in range(N):
-            obj_to_i = (obj_to_img==i).nonzero().view(-1)
-            loss = self._inside_loss(boxes[obj_to_i],fragment_boxes[[i]])
+            obj_to_i = (obj_to_img == i).nonzero(as_tuple=False).view(-1)
+            if len(obj_to_i) == 0: continue
+            loss = self._inside_loss(boxes[obj_to_i], fragment_boxes[[i]])
             losses.append(loss)
-        return torch.mean(torch.stack(losses))
+        return torch.mean(torch.stack(losses)) if losses else torch.tensor(0.0, device=boxes.device)
 
 class CoverageLoss(nn.Module):
-    def __init__(self,nsample=100,cuda=True):
-        super(CoverageLoss,self).__init__()
-        self.step = round(nsample/4)
-        self.BP = self.step*4
-        self.boundary = sample_boundary(step=self.step).view(1,self.BP,2)
-        self.boundary = self.boundary.cuda()
+    def __init__(self, nsample=100):
+        super(CoverageLoss, self).__init__()
+        self.step = round(nsample / 4)
+        self.BP = self.step * 4
+        self.boundary = sample_boundary(step=self.step).view(1, self.BP, 2)
 
-    def _coverage_loss(self,boxes,fragments):
+    def _coverage_loss(self, boxes, fragments):
         B, _ = boxes.shape
-        F,FP, _ = fragments.shape
-        box_wh=boxes[:,2:]-boxes[:,:2]
+        F, FP, _ = fragments.shape
+        box_wh = boxes[:, 2:] - boxes[:, :2]
+
+        # Move internal tensors to the correct device
+        boundary = self.boundary.to(boxes.device)
 
         # [B,BP,2]
-        box_points = self.boundary*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_points = boundary * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
         # [F,FP,B]
-        f_out_box = fragment_outside_box(fragments,boxes)
+        f_out_box = fragment_outside_box(fragments, boxes)
         # [F,FP,B]
-        f_b_dist = fragment_box_distance(fragments,box_points)
+        f_b_dist = fragment_box_distance(fragments, box_points)
         # [F,FP]
-        return (f_b_dist*f_out_box).min(-1)[0].sum()/FP   
+        return (f_b_dist * f_out_box).min(-1)[0].sum() / FP
 
-    def test(self,boxes,fragments):
+    def test(self, boxes, fragments):
         with torch.no_grad():
-            return self._coverage_loss(boxes,fragments)
+            return self._coverage_loss(boxes, fragments)
 
-    def forward(self,boxes,fragments,obj_to_img,reduction="mean"):
-        N = obj_to_img.data.max().item() + 1
+    def forward(self, boxes, fragments, obj_to_img, reduction="mean"):
+        if obj_to_img.numel() == 0:
+            return torch.tensor(0.0, device=boxes.device)
+        N = obj_to_img.max().item() + 1
         boxes = box_utils.centers_to_extents(boxes)
 
         losses = []
         for i in range(N):
-            obj_to_i = (obj_to_img==i).nonzero().view(-1)
-            loss = self._coverage_loss(boxes[obj_to_i],fragments[i])
+            obj_to_i = (obj_to_img == i).nonzero(as_tuple=False).view(-1)
+            if len(obj_to_i) == 0: continue
+            loss = self._coverage_loss(boxes[obj_to_i], fragments[i].unsqueeze(0)) # Add batch dim
             losses.append(loss)
-        return torch.mean(torch.stack(losses))
+        return torch.mean(torch.stack(losses)) if losses else torch.tensor(0.0, device=boxes.device)
 
 class MutexLoss(nn.Module):
-    def __init__(self,nsample=100,cuda=True):
-        super(MutexLoss,self).__init__()
-        self.bstep = round(nsample/4)
+    def __init__(self, nsample=100):
+        super(MutexLoss, self).__init__()
+        self.bstep = round(nsample / 4)
         self.fstep = round(math.sqrt(nsample))
-        self.BP = self.bstep*4
-        self.FP = self.fstep*self.fstep
-        self.boundary = sample_boundary(step=self.bstep).view(1,self.BP,2)
-        self.fragment = sample_fragment(step=self.fstep).view(1,self.FP,2)
-        if cuda:
-            self.boundary=self.boundary.cuda()
-            self.fragment=self.fragment.cuda()
+        self.BP = self.bstep * 4
+        self.FP = self.fstep * self.fstep
+        self.boundary = sample_boundary(step=self.bstep).view(1, self.BP, 2)
+        self.fragment = sample_fragment(step=self.fstep).view(1, self.FP, 2)
 
-    def _mutex_loss(self,boxes):
+    def _mutex_loss(self, boxes):
         B = boxes.shape[0]
-        box_wh=boxes[:,2:]-boxes[:,:2]
+        if B <= 1: return torch.tensor(0.0, device=boxes.device)
+        box_wh = boxes[:, 2:] - boxes[:, :2]
+
+        # Move internal tensors to the correct device
+        boundary = self.boundary.to(boxes.device)
+        fragment = self.fragment.to(boxes.device)
 
         # [B,FP,2]
-        fragments = self.fragment*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        fragments = fragment * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
         # [B,BP,2]
-        box_points = self.boundary*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_points = boundary * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
 
         # [B,FP,B]
-        f_in_box = 1-fragment_outside_box(fragments,boxes)
+        f_in_box = 1 - fragment_outside_box(fragments, boxes)
         # clear dist to self
-        f_in_box[range(B),:,range(B)]=0
+        f_in_box[range(B), :, range(B)] = 0
         # [B,FP,B] B个Box的PP个点与B个Box的最小距离
-        f_b_dist = fragment_box_distance(fragments,box_points)
+        f_b_dist = fragment_box_distance(fragments, box_points)
 
-        return (f_b_dist*f_in_box).sum()/(B*self.FP-B)     
-    
-    def test(self,boxes):
+        return (f_b_dist * f_in_box).sum() / (B * self.FP - B)
+
+    def test(self, boxes):
         with torch.no_grad():
             return self._mutex_loss(boxes)
-    
-    def forward(self,boxes,obj_to_img,objs=None,reduction="mean"):
-        N = obj_to_img.data.max().item() + 1
+
+    def forward(self, boxes, obj_to_img, objs=None, reduction="mean"):
+        if obj_to_img.numel() == 0:
+            return torch.tensor(0.0, device=boxes.device)
+        N = obj_to_img.max().item() + 1
         boxes = box_utils.centers_to_extents(boxes)
         losses = []
         for i in range(N):
-            obj_to_i = ((obj_to_img==i)*(objs!=0)).nonzero().view(-1)
+            if objs is not None:
+                obj_to_i = ((obj_to_img == i) & (objs != 0)).nonzero(as_tuple=False).view(-1)
+            else:
+                obj_to_i = (obj_to_img == i).nonzero(as_tuple=False).view(-1)
+            if len(obj_to_i) == 0: continue
             loss = self._mutex_loss(boxes[obj_to_i])
             losses.append(loss)
-        return torch.mean(torch.stack(losses))
+        return torch.mean(torch.stack(losses)) if losses else torch.tensor(0.0, device=boxes.device)
 
 class BoxRenderLoss(nn.Module):
-    def __init__(self,nsample=100,cuda=True):
-        super(BoxRenderLoss,self).__init__()
-        self.bstep = round(nsample/4)
+    def __init__(self, nsample=100):
+        super(BoxRenderLoss, self).__init__()
+        self.bstep = round(nsample / 4)
         self.fstep = round(math.sqrt(nsample))
-        self.BP = self.bstep*4
-        self.FP = self.fstep*self.fstep
-        self.boundary = sample_boundary(step=self.bstep).view(1,self.BP,2)
-        self.fragment = sample_fragment(step=self.fstep).view(1,self.FP,2)
-        if cuda:
-            self.boundary=self.boundary.cuda()
-            self.fragment=self.fragment.cuda()
+        self.BP = self.bstep * 4
+        self.FP = self.fstep * self.fstep
+        self.boundary = sample_boundary(step=self.bstep).view(1, self.BP, 2)
+        self.fragment = sample_fragment(step=self.fstep).view(1, self.FP, 2)
 
-    def _fragment_outside_box(self,fragments,boxes):
-        assert fragments.dim()==3
-        F,FP,_ = fragments.shape
+    def _fragment_outside_box(self, fragments, boxes):
+        assert fragments.dim() == 3
+        F, FP, _ = fragments.shape
 
         diff = torch.cat([
-            fragments.view(F,FP,2)-boxes[:,:2].view(F,1,2),
-            boxes[:,2:].view(F,1,2)-fragments.view(F,FP,2)
-        ],dim=-1)
-        
-        return ((diff>=0).sum(-1)!=4).float()
+            fragments.view(F, FP, 2) - boxes[:, :2].view(F, 1, 2),
+            boxes[:, 2:].view(F, 1, 2) - fragments.view(F, FP, 2)
+        ], dim=-1)
 
-    def _fragment_box_distance(self,fragments,box_points):
-        F,FP,_ = fragments.shape
-        B,BP,_ = box_points.shape
-        return (fragments.view(F,FP,1,2)-box_points.view(B,1,BP,2)).pow(2).sum(-1).min(-1)[0]
+        return ((diff >= 0).sum(-1) != 4).float()
 
-    def _render_loss(self,boxes,targets):
+    def _fragment_box_distance(self, fragments, box_points):
+        F, FP, _ = fragments.shape
+        B, BP, _ = box_points.shape
+        return (fragments.view(F, FP, 1, 2) - box_points.view(B, 1, BP, 2)).pow(2).sum(-1).min(-1)[0]
+
+    def _render_loss(self, boxes, targets):
         B = boxes.shape[0]
-        box_wh=boxes[:,2:]-boxes[:,:2]
-        target_wh=targets[:,2:]-targets[:,:2]
+        if B == 0: return torch.tensor(0.0, device=boxes.device)
+        box_wh = boxes[:, 2:] - boxes[:, :2]
+        target_wh = targets[:, 2:] - targets[:, :2]
+
+        # Move internal tensors to the correct device
+        boundary = self.boundary.to(boxes.device)
+        fragment = self.fragment.to(boxes.device)
 
         # [B,FP,2]
-        box_fragments = self.fragment*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_fragments = fragment * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
         # [B,BP,2]
-        box_points = self.boundary*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_points = boundary * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
 
         # [B,FP,2]
-        target_fragments = self.fragment*target_wh.view(B,1,2)+targets[:,:2].view(B,1,2)
+        target_fragments = fragment * target_wh.view(B, 1, 2) + targets[:, :2].view(B, 1, 2)
         # [B,BP,2]
-        target_points = self.boundary*target_wh.view(B,1,2)+targets[:,:2].view(B,1,2)
+        target_points = boundary * target_wh.view(B, 1, 2) + targets[:, :2].view(B, 1, 2)
 
         # [B,FP]
-        b_out_t = self._fragment_outside_box(box_fragments,targets)
-        t_out_b = self._fragment_outside_box(target_fragments,boxes)
+        b_out_t = self._fragment_outside_box(box_fragments, targets)
+        t_out_b = self._fragment_outside_box(target_fragments, boxes)
 
         # [B,FP] B个Box的PP个点与B个Box的最小距离
-        b_t_dist = self._fragment_box_distance(box_fragments,target_points)
-        t_b_dist = self._fragment_box_distance(target_fragments,box_points)
+        b_t_dist = self._fragment_box_distance(box_fragments, target_points)
+        t_b_dist = self._fragment_box_distance(target_fragments, box_points)
 
-        return ((b_t_dist*b_out_t).sum()+(t_b_dist*t_out_b).sum())/(2*B*self.FP)
+        return ((b_t_dist * b_out_t).sum() + (t_b_dist * t_out_b).sum()) / (2 * B * self.FP)
 
-    def test(self,boxes,targets):
+    def test(self, boxes, targets):
         with torch.no_grad():
-            return _render_loss(self,boxes,targets)
+            return self._render_loss(boxes, targets)
 
-    def forward(self,boxes,targets,reduction="mean"):
-        return torch.mean(self._render_loss(boxes,targets))
+    def forward(self, boxes, targets, reduction="mean"):
+        return torch.mean(self._render_loss(boxes, targets))
 
 
 class DoorLoss(nn.Module):
-    def __init__(self,nsample=100,cuda=True):
-        super(DoorLoss,self).__init__()
-        self.bstep = round(nsample/4)
+    def __init__(self, nsample=100):
+        super(DoorLoss, self).__init__()
+        self.bstep = round(nsample / 4)
         self.fstep = round(math.sqrt(nsample))
-        self.BP = self.bstep*4
-        self.FP = self.fstep*self.fstep
-        self.boundary = sample_boundary(step=self.bstep).view(1,self.BP,2)
-        self.fragment = sample_fragment(step=self.fstep).view(1,self.FP,2)
-        if cuda:
-            self.boundary=self.boundary.cuda()
-            self.fragment=self.fragment.cuda()
+        self.BP = self.bstep * 4
+        self.FP = self.fstep * self.fstep
+        self.boundary = sample_boundary(step=self.bstep).view(1, self.BP, 2)
+        self.fragment = sample_fragment(step=self.fstep).view(1, self.FP, 2)
 
-    def _door_loss(self,boxes,doors,objs):
+    def _door_loss(self, boxes, doors, objs):
         B, _ = boxes.shape
         F, _ = doors.shape
-        box_wh=boxes[:,2:]-boxes[:,:2]
-        door_wh = doors[:,2:]-doors[:,:2]
+        if B == 0 or F == 0: return torch.tensor(0.0, device=boxes.device)
+        box_wh = boxes[:, 2:] - boxes[:, :2]
+        door_wh = doors[:, 2:] - doors[:, :2]
+
+        # Move internal tensors to the correct device
+        boundary = self.boundary.to(boxes.device)
+        fragment = self.fragment.to(boxes.device)
 
         # [B,BP,2]
-        box_boundaries = self.boundary*box_wh.view(B,1,2)+boxes[:,:2].view(B,1,2)
+        box_boundaries = boundary * box_wh.view(B, 1, 2) + boxes[:, :2].view(B, 1, 2)
         # [F,FP,2]
-        door_fragments = self.fragment*door_wh.view(F,1,2)+doors[:,:2].view(F,1,2)
+        door_fragments = fragment * door_wh.view(F, 1, 2) + doors[:, :2].view(F, 1, 2)
         # [F,FP,B]
-        f_out_box = (objs-fragment_outside_box(door_fragments,boxes)).abs()
+        f_out_box = (objs - fragment_outside_box(door_fragments, boxes)).abs()
         # [F,FP,B]
-        f_b_dist = fragment_box_distance(door_fragments,box_boundaries)
+        f_b_dist = fragment_box_distance(door_fragments, box_boundaries)
         # [F,FP]
-        return (f_b_dist*f_out_box).sum()/(F*self.FP) 
+        return (f_b_dist * f_out_box).sum() / (F * self.FP)
 
-    def forward(self,boxes,doors,obj_to_img,objs=None,reduction="mean"):
-        N = obj_to_img.data.max().item() + 1
+    def forward(self, boxes, doors, obj_to_img, objs=None, reduction="mean"):
+        if obj_to_img.numel() == 0:
+            return torch.tensor(0.0, device=boxes.device)
+        N = obj_to_img.max().item() + 1
         boxes = box_utils.centers_to_extents(boxes)
 
         losses = []
         for i in range(N):
-            obj_to_i = ((obj_to_img==i)).nonzero().view(-1)
-            objs_i = (objs[obj_to_img==i]!=0).long()
-            loss = self._door_loss(boxes[obj_to_i],doors[[i]],objs_i)
+            obj_to_i = (obj_to_img == i).nonzero(as_tuple=False).view(-1)
+            if len(obj_to_i) == 0: continue
+
+            objs_i = (objs[obj_to_img == i] != 0).long()
+            loss = self._door_loss(boxes[obj_to_i], doors[[i]], objs_i)
             losses.append(loss)
-        return torch.mean(torch.stack(losses))
+        return torch.mean(torch.stack(losses)) if losses else torch.tensor(0.0, device=boxes.device)
 
 if __name__ == "__main__":
     # [4]

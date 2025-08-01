@@ -64,8 +64,10 @@ def sample_tf(x,y,ndim=1000):
 data = sio.loadmat(data_path, squeeze_me=True, struct_as_record=False)['data']
 data_dict = {d.name:d for d in data}
 
-names_train = open('./data/train.txt').read().split('\n')
-names_test = open('./data/test.txt').read().split('\n')
+with open('./data/train.txt', 'r') as f:
+    names_train = [line.strip() for line in f if line.strip()]
+with open('./data/test.txt', 'r') as f:
+    names_test = [line.strip() for line in f if line.strip()]
 n_train = len(names_train)
 n_test = len(names_test)
 

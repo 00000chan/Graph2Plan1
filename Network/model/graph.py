@@ -72,8 +72,8 @@ class GraphTripleConv(nn.Module):
         Din, H, Dout = self.input_dim, self.hidden_dim, self.output_dim
 
         # Break apart indices for subjects and objects; these have shape (T,)
-        s_idx = edges[:, 0].contiguous()
-        o_idx = edges[:, 1].contiguous()
+        s_idx = edges[:, 0]
+        o_idx = edges[:, 1]
 
         # Get current vectors for subjects and objects; these have shape (T, Din)
         cur_s_vecs = obj_vecs[s_idx]

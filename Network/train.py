@@ -15,7 +15,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 
 from model.utils import int_tuple, str_tuple, bool_flag
 from model.metrics import iou,MetricAverage,image_acc,image_acc_ignore,binary_image_acc
@@ -25,13 +25,32 @@ from model.loss import *
 from model.box_utils import *
 from model.utils import *
 
-from ignite.contrib.handlers.tensorboard_logger import *
-from ignite.contrib.handlers import *
-from ignite.contrib.metrics import *
+from ignite.engine import Engine, Events
+from ignite.handlers import ModelCheckpoint, ProgressBar
+from ignite.metrics import Metric, Loss
 from ignite.metrics.accuracy import _BaseClassification
-from ignite.engine import *
-from ignite.handlers import *
-from ignite.metrics import *
+
+# Custom MetricAverage class to replace the deprecated one from ignite.contrib
+class MetricAverage(Metric):
+    def __init__(self, output_transform=lambda x: x):
+        super(MetricAverage, self).__init__(output_transform)
+        self._sum = 0
+        self._num_examples = 0
+
+    def reset(self):
+        self._sum = 0
+        self._num_examples = 0
+
+    def update(self, output):
+        self._sum += output * self._num_examples
+        self._num_examples += 1
+
+    def compute(self):
+        if self._num_examples == 0:
+            return 0
+        return self._sum / self._num_examples
+
+from ignite.handlers.tensorboard_logger import *
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -168,7 +187,8 @@ def get_scheduler(optimizer,args):
 
 def get_losses(args):
     loss = {}
-    weight = torch.ones(15).cuda()
+    # Weight is created on CPU and will be moved to the correct device later
+    weight = torch.ones(15)
     weight[13]=weight[14]=0 # ignore unused category
     if args.gene_layout: 
         loss['gene_ce'] = torch.nn.CrossEntropyLoss(weight=weight)
@@ -185,13 +205,13 @@ def get_losses(args):
         loss['render'] = BoxRenderLoss(nsample=args.nsample)
     return loss
 
-def batch_cuda(batch):
+def send_batch_to_device(batch, device):
     batch = list(batch)
     for i in range(len(batch)):
-        if isinstance(batch[i],torch.Tensor):
-            batch[i] = batch[i].cuda()
-        elif isinstance(batch[i],list) and isinstance(batch[i][0],torch.Tensor):
-            batch[i] = [e.cuda() for e in batch[i]]
+        if isinstance(batch[i], torch.Tensor):
+            batch[i] = batch[i].to(device)
+        elif isinstance(batch[i], list) and isinstance(batch[i][0], torch.Tensor):
+            batch[i] = [e.to(device) for e in batch[i]]
     return batch
 
 def main(args):
@@ -230,6 +250,8 @@ def main(args):
     # check_manual_seed(args)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu if args.multi_gpu is None else args.multi_gpu
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
 
     print("Create dataloader...")
     train_loader,valid_loader,test_loader = get_data_loaders(args)
@@ -253,19 +275,24 @@ def main(args):
     logger.info(str(model))
     optimizer = get_optimizer(model,args)
     scheduler = get_scheduler(optimizer,args)
+
+    # Move loss weights to the correct device
     loss = get_losses(args)
+    for k, v in loss.items():
+        if hasattr(v, 'to'):
+            loss[k] = v.to(device)
 
     if args.pretrain is not None:
-        model.load_state_dict(torch.load(args.pretrain))
+        model.load_state_dict(torch.load(args.pretrain, map_location=device))
 
-    print("Cuda...")
-    model.cuda()
+    print("Moving model to device...")
+    model.to(device)
 
     def update(engine,batch):
         model.train()
         optimizer.zero_grad()
         
-        boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = batch_cuda(batch)
+        boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = send_batch_to_device(batch, device)
 
         if args.relative: boxes = box_rel2abs(boxes,inside_box,obj_to_img)
 
@@ -324,7 +351,7 @@ def main(args):
     def inference(engine,batch):
         model.eval()
         with torch.no_grad():
-            boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = batch_cuda(batch)
+            boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = send_batch_to_device(batch, device)
 
             if args.relative: boxes = box_rel2abs(boxes,inside_box,obj_to_img)
 
@@ -424,29 +451,41 @@ def main(args):
         valid_evaluator.run(valid_loader)
 
     # Metrics
+    Loss(loss_fn=lambda y_pred, y: y_pred['loss']['total_loss']).attach(valid_evaluator, 'total_loss')
     MetricAverage(output_transform=lambda output:iou(output['pred'][0],output['gt'][1])).attach(valid_evaluator,'box_iou')
     if args.gene_layout: 
         MetricAverage(output_transform=lambda output:image_acc_ignore(output['pred'][1],output['gt'][0],13)).attach(valid_evaluator,'gene_acc')
     if args.box_refine: 
         MetricAverage(output_transform=lambda output:iou(output['pred'][2],output['gt'][1])).attach(valid_evaluator,'box_refine_iou')
     
-    metrics = ['img_acc','box_iou','mask_acc']
-
     # TQDM
-    ProgressBar(persist=True).attach(trainer, output_transform=lambda o:{'loss':o['total_loss']}, metric_names='all')
-    ProgressBar(persist=False).attach(valid_evaluator, output_transform=lambda o:{'loss':o['loss']['total_loss']},metric_names='all')
+    ProgressBar(persist=True).attach(trainer, output_transform=lambda o:{'loss':o['total_loss']})
+    ProgressBar(persist=False).attach(valid_evaluator)
     
-    # Tensorboard 
+    # Tensorboard
     tb_logger = TensorboardLogger(log_dir=log_dir)
-    tb_logger.attach(trainer,
-                 log_handler=OutputHandler(tag="train",output_transform=lambda o: o,metric_names='all'),
-                 event_name=Events.ITERATION_COMPLETED)
-    tb_logger.attach(trainer,
-                 log_handler=OptimizerParamsHandler(optimizer),
-                 event_name=Events.ITERATION_STARTED)
-    tb_logger.attach(valid_evaluator,
-                 log_handler=OutputHandler(tag="valid",output_transform=lambda o:o['loss'],metric_names='all', global_step_transform=global_step_from_engine(trainer)),
-                 event_name=Events.EPOCH_COMPLETED)
+
+    tb_logger.attach(
+        trainer,
+        log_handler=OptimizerParamsHandler(optimizer),
+        event_name=Events.ITERATION_STARTED
+    )
+
+    tb_logger.attach(
+        trainer,
+        log_handler=OutputHandler(tag="training", output_transform=lambda loss: {'total_loss': loss['total_loss']}),
+        event_name=Events.ITERATION_COMPLETED
+    )
+
+    tb_logger.attach(
+        valid_evaluator,
+        log_handler=OutputHandler(
+            tag="validation",
+            metric_names="all",
+            global_step_transform=global_step_from_engine(trainer),
+        ),
+        event_name=Events.EPOCH_COMPLETED
+    )
     
     # Logging
     @trainer.on(Events.EPOCH_COMPLETED)
@@ -461,13 +500,21 @@ def main(args):
         logging.info(f'Valid, Epoch{engine.state.epoch}, Metrics: {str(metrics)}')
     
     # Checkpoint
-    epoch_saver = ModelCheckpoint(checkpoints_dir, 'epoch',save_interval=args.save_interval,n_saved=args.n_saved, require_empty=False, create_dir=True)
-    latest_saver = ModelCheckpoint(checkpoints_dir, 'latest',score_function=lambda e:e.state.epoch,n_saved=1, require_empty=False, create_dir=True)
-    loss_saver = ModelCheckpoint(checkpoints_dir, 'loss',score_function=lambda e:-e.state.output['loss']['total_loss'],n_saved=1, require_empty=False, create_dir=True)
+    # The 'require_empty' argument is deprecated.
+    # The 'save_interval' is now handled by the event system.
+    latest_saver = ModelCheckpoint(checkpoints_dir, 'latest', n_saved=1, create_dir=True)
+    best_loss_saver = ModelCheckpoint(checkpoints_dir, 'best_loss', n_saved=1, create_dir=True,
+                                     score_function=lambda e: -e.state.metrics['total_loss'], score_name="val_loss")
 
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, latest_saver, {'model': model,'opt':optimizer})
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, epoch_saver, {'model': model,'opt':optimizer})
-    valid_evaluator.add_event_handler(Events.COMPLETED, loss_saver, {'model': model})
+    # Attach handlers
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, latest_saver, {'model': model, 'opt': optimizer})
+
+    # Save a checkpoint every `save_interval` epochs
+    if args.save_interval > 0:
+        epoch_saver = ModelCheckpoint(checkpoints_dir, 'epoch', n_saved=args.n_saved, create_dir=True)
+        trainer.add_event_handler(Events.EPOCH_COMPLETED(every=args.save_interval), epoch_saver, {'model': model, 'opt': optimizer})
+
+    valid_evaluator.add_event_handler(Events.COMPLETED, best_loss_saver, {'model': model})
 
     if not args.skip_train:
         trainer.run(train_loader,max_epochs=args.epoch)
@@ -477,7 +524,7 @@ def main(args):
     def test(engine,batch):
         model.eval()
         with torch.no_grad():
-            boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = batch_cuda(batch)
+            boundary,inside_box,objs,attrs,triples,layout,boxes,inside_coords,obj_to_img,triple_to_img,name = send_batch_to_device(batch, device)
 
             model_out = model(
                 objs, 

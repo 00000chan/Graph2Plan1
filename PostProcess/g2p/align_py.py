@@ -300,6 +300,120 @@ def align_neighbor_py(box, r_edge, updated, threshold):
     return box, updated
 
 
+import networkx as nx
+
+def find_room_order_py(adj_matrix):
+    """
+    Python port of find_room_order.m using networkx.
+    Performs a topological sort on the room overlap graph to find a valid drawing order.
+    """
+    try:
+        # Create a directed graph from the adjacency matrix
+        graph = nx.from_numpy_array(adj_matrix, create_using=nx.DiGraph)
+
+        # Perform topological sort
+        # This will raise an error if the graph has a cycle
+        order = list(nx.topological_sort(graph))
+        return np.array(order)
+
+    except nx.NetworkXUnfeasible:
+        # This block handles cases where a cycle is detected (which shouldn't happen with area-based ordering)
+        # but mimics the MATLAB code's fallback of just returning a partial or incorrect order.
+        print("Warning: Cycle detected in room overlap graph. Resulting order may be incorrect.")
+        # Fallback similar to MATLAB's simple cycle breaking
+        graph = nx.from_numpy_array(adj_matrix, create_using=nx.DiGraph)
+        order = []
+        while graph.number_of_nodes() > 0:
+            in_degrees = dict(graph.in_degree())
+            # Find nodes with in-degree 0
+            zero_in_degree_nodes = [node for node, degree in in_degrees.items() if degree == 0]
+
+            # If no such node, break cycle by picking node with lowest in-degree > 0
+            if not zero_in_degree_nodes:
+                min_degree = min(d for d in in_degrees.values() if d > 0)
+                zero_in_degree_nodes = [node for node, degree in in_degrees.items() if degree == min_degree]
+
+            # Add these nodes to the order and remove from graph
+            node_to_remove = zero_in_degree_nodes[0]
+            order.append(node_to_remove)
+            graph.remove_node(node_to_remove)
+        return np.array(order)
+
+
+def regularize_fp_py(box, boundary, r_type):
+    """
+    Python port of regularize_fp.m
+    Crops rooms to the boundary, determines drawing order, and fills gaps.
+    """
+    from shapely.geometry import Polygon, box as shapely_box, MultiPolygon
+    from shapely.ops import unary_union
+
+    # 1. Crop each room box to the building boundary
+    is_new = boundary[:, 3]
+    poly_boundary = Polygon(boundary[is_new == 0, :2])
+
+    for i in range(box.shape[0]):
+        poly_room = shapely_box(box[i, 0], box[i, 1], box[i, 2], box[i, 3])
+        intersection = poly_boundary.intersection(poly_room)
+        if not intersection.is_empty:
+            box[i, :] = np.array(intersection.bounds)
+        else:
+            print(f"Warning: Room {i} is completely outside the building boundary.")
+
+    # 2. Determine drawing order based on overlaps
+    num_rooms = box.shape[0]
+    order_m = np.zeros((num_rooms, num_rooms), dtype=bool)
+    room_polys = [shapely_box(b[0], b[1], b[2], b[3]) for b in box]
+
+    for i in range(num_rooms):
+        for j in range(i + 1, num_rooms):
+            if room_polys[i].intersects(room_polys[j]):
+                if room_polys[i].area <= room_polys[j].area:
+                    order_m[i, j] = True
+                else:
+                    order_m[j, i] = True
+
+    order = find_room_order_py(order_m)
+    # MATLAB version reverses the order, let's replicate that
+    order = order[::-1]
+
+    # 3. Fill gaps
+    living_idx = np.where(r_type == 0)[0]
+    if len(living_idx) == 0: return box, order # No living room, can't fill gaps
+    living_idx = living_idx[0]
+
+    # Subtract all non-living room areas from the main boundary
+    other_rooms_union = unary_union([room_polys[i] for i in range(num_rooms) if i != living_idx])
+    gaps = poly_boundary.difference(other_rooms_union)
+
+    if isinstance(gaps, Polygon):
+        # Only one gap, assume it's the living room
+        box[living_idx, :] = np.array(gaps.bounds)
+    elif isinstance(gaps, MultiPolygon):
+        living_poly = room_polys[living_idx]
+
+        # Find the gap that has the biggest overlap with the original living room
+        overlap_areas = np.array([gap.intersection(living_poly).area for gap in gaps.geoms])
+        living_gap_idx = np.argmax(overlap_areas)
+
+        for k, gap_poly in enumerate(gaps.geoms):
+            if k == living_gap_idx:
+                box[living_idx, :] = np.array(gap_poly.bounds)
+            else:
+                # For other gaps, find the closest room and expand it
+                gap_center = np.array(gap_poly.centroid.coords)
+                box_centers = np.array([((b[0]+b[2])/2, (b[1]+b[3])/2) for b in box])
+                distances = np.linalg.norm(box_centers - gap_center, axis=1)
+                closest_room_idx = np.argmin(distances)
+
+                # Expand the closest room to include the gap
+                expanded_poly = unary_union([room_polys[closest_room_idx], gap_poly])
+                box[closest_room_idx, :] = np.array(expanded_poly.bounds)
+                room_polys[closest_room_idx] = expanded_poly # Update for next iteration
+
+    return box, order
+
+
 def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_result=False):
     """
     Python port of the main align_fp.m script.
@@ -322,14 +436,16 @@ def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_resu
     new_box, updated = align_neighbor_py(new_box, r_edge, updated, threshold)
     print("Step 2: align_neighbor_py complete.")
 
+    # 3. Regularize floorplan
+    new_box, order = regularize_fp_py(new_box, boundary, r_type)
+    print("Step 3: regularize_fp_py complete.")
+
     # --- TODO: Port the rest of the align_fp.m pipeline ---
-    # 3. regularize_fp_py
     # 4. get_room_boundary_py
 
     # For now, return placeholder values
     num_rooms = new_box.shape[0]
-    order = np.arange(num_rooms)
     r_boundary = np.array([b for b in new_box], dtype=object) # Placeholder
 
-    print("Placeholder: Returning boundary-aligned boxes.")
+    print("Placeholder: Returning regularized boxes.")
     return new_box, order, r_boundary

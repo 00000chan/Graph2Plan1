@@ -178,6 +178,128 @@ def align_with_boundary_py(box, boundary, threshold, r_type):
     return box, updated
 
 
+def align_adjacent_room3_py(box, temp_box, updated, type, threshold):
+    """
+    Python port of align_adjacent_room3.m.
+    Aligns two adjacent rooms based on their relationship type.
+    """
+    new_box = box.copy()
+
+    # This nested function mimics the behavior of the MATLAB `align` sub-function.
+    def align(idx1, idx2, align_threshold, attach=False):
+        # idx1 and idx2 are tuples like (box_index, side_index), e.g., (0, 0) for box 0, left side
+        # In MATLAB, this was 1-based, here it's 0-based.
+        box1_idx, side1_idx = idx1
+        box2_idx, side2_idx = idx2
+
+        # Check if the distance is within the threshold
+        if abs(temp_box[box1_idx, side1_idx] - temp_box[box2_idx, side2_idx]) <= align_threshold:
+            # If one box was updated and the other wasn't, snap the non-updated to the updated.
+            if updated[box1_idx, side1_idx] and not updated[box2_idx, side2_idx]:
+                new_box[box2_idx, side2_idx] = new_box[box1_idx, side1_idx]
+            elif updated[box2_idx, side2_idx] and not updated[box1_idx, side1_idx]:
+                new_box[box1_idx, side1_idx] = new_box[box2_idx, side2_idx]
+            # If neither has been updated, move both halfway.
+            elif not updated[box1_idx, side1_idx] and not updated[box2_idx, side2_idx]:
+                if attach:
+                    new_box[box2_idx, side2_idx] = new_box[box1_idx, side1_idx]
+                else:
+                    y = (new_box[box1_idx, side1_idx] + new_box[box2_idx, side2_idx]) / 2.0
+                    new_box[box1_idx, side1_idx] = y
+                    new_box[box2_idx, side2_idx] = y
+            return True
+        return False
+
+    # Relationship type mapping:
+    # 0:left-above, 1:left-below, 2:left-of, 3:above, 4:inside,
+    # 5:surrounding, 6:below, 7:right-of, 8:right-above, 9:right-below
+
+    # Note: MATLAB's logic for diagonal cases (0,1,8,9) is complex and appears to have
+    # further sub-logic in alignV/alignH. For now, we replicate the main cases.
+
+    if type == 2: # left-of (box1 is left of box2)
+        # align box1's right edge (2) with box2's left edge (0)
+        align((0, 2), (1, 0), threshold)
+        # align tops and bottoms within a smaller threshold
+        align((0, 1), (1, 1), threshold / 2)
+        align((0, 3), (1, 3), threshold / 2)
+    elif type == 3: # above (box1 is above box2)
+        # align box1's bottom edge (3) with box2's top edge (1)
+        align((0, 3), (1, 1), threshold)
+        # align lefts and rights
+        align((0, 0), (1, 0), threshold / 2)
+        align((0, 2), (1, 2), threshold / 2)
+    elif type == 4: # inside (box1 is inside box2)
+        align((1,0), (0,0), threshold, attach=True)
+        align((1,1), (0,1), threshold, attach=True)
+        align((1,2), (0,2), threshold, attach=True)
+        align((1,3), (0,3), threshold, attach=True)
+    elif type == 6: # below (box1 is below box2)
+        # align box1's top edge (1) with box2's bottom edge (3)
+        align((0, 1), (1, 3), threshold)
+        align((0, 0), (1, 0), threshold / 2)
+        align((0, 2), (1, 2), threshold / 2)
+    elif type == 7: # right-of (box1 is right of box2)
+        # align box1's left edge (0) with box2's right edge (2)
+        align((0, 0), (1, 2), threshold)
+        align((0, 1), (1, 1), threshold / 2)
+        align((0, 3), (1, 3), threshold / 2)
+
+    # The diagonal cases (0, 1, 8, 9) and surrounding (5) are more complex
+    # and are omitted in this simplified first-pass port. They can be added later.
+
+    return new_box
+
+
+def align_neighbor_py(box, r_edge, updated, threshold):
+    """
+    Python port of align_neighbor.m
+    """
+    temp_box = box.copy()
+    checked = np.zeros(r_edge.shape[0], dtype=bool)
+
+    # This helper calculates how many sides of a room pair have been updated
+    def get_updated_count(upd, edge_list):
+        counts = np.zeros(edge_list.shape[0])
+        for k, edge in enumerate(edge_list):
+            indices = edge[:2] # In Python, indices are already 0-based
+            counts[k] = np.sum(upd[indices, :])
+        return counts
+
+    updated_count = get_updated_count(updated, r_edge)
+
+    for i in range(r_edge.shape[0]):
+        # Find the unchecked edge with the most updated sides
+        unchecked_indices = np.where(~checked)[0]
+        if len(unchecked_indices) == 0:
+            break
+
+        best_local_idx = np.argmax(updated_count[unchecked_indices])
+        edge_idx = unchecked_indices[best_local_idx]
+        checked[edge_idx] = True
+
+        current_edge = r_edge[edge_idx]
+        room_indices = current_edge[:2]
+        rel_type = current_edge[2]
+
+        # Call the alignment function for the pair of rooms
+        b = align_adjacent_room3_py(
+            box[room_indices, :],
+            temp_box[room_indices, :],
+            updated[room_indices, :],
+            rel_type,
+            threshold + 6 # MATLAB code adds 6 to the threshold here
+        )
+
+        # Update the main box array with the aligned results
+        box[room_indices, :] = b
+
+        # Recalculate updated counts for the next iteration
+        updated_count = get_updated_count(updated, r_edge)
+
+    return box, updated
+
+
 def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_result=False):
     """
     Python port of the main align_fp.m script.
@@ -185,12 +307,22 @@ def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_resu
     """
     print("Running Python-native alignment...")
 
+    # The MATLAB code re-orders edges to process living room last. We replicate this.
+    living_idx = np.where(r_type == 0)[0]
+    if len(living_idx) > 0:
+        living_idx = living_idx[0]
+        is_living_edge = (r_edge[:, 0] == living_idx) | (r_edge[:, 1] == living_idx)
+        r_edge = np.vstack([r_edge[~is_living_edge], r_edge[is_living_edge]])
+
     # 1. Align with boundary
     new_box, updated = align_with_boundary_py(r_box.copy(), boundary, threshold, r_type)
     print("Step 1: align_with_boundary_py complete.")
 
+    # 2. Align with neighbors
+    new_box, updated = align_neighbor_py(new_box, r_edge, updated, threshold)
+    print("Step 2: align_neighbor_py complete.")
+
     # --- TODO: Port the rest of the align_fp.m pipeline ---
-    # 2. align_neighbor_py
     # 3. regularize_fp_py
     # 4. get_room_boundary_py
 

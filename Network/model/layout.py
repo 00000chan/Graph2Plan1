@@ -141,7 +141,9 @@ def _pool_samples(samples, obj_to_img, pooling='sum'):
   """
   dtype, device = samples.dtype, samples.device
   O, D, H, W = samples.size()
-  N = obj_to_img.data.max().item() + 1
+  if obj_to_img.numel() == 0:
+      return torch.zeros(0, D, H, W, dtype=dtype, device=device)
+  N = obj_to_img.max().item() + 1
   
   # Use scatter_add to sum the sampled outputs for each image
   out = torch.zeros(N, D, H, W, dtype=dtype, device=device)
@@ -191,13 +193,15 @@ def masks_to_seg(boxes, masks, objs, obj_to_img, H, W=None, num_classes=15):
   assert masks.size() == (O, M, M)
   if W is None:
     W = H
-  N = obj_to_img.data.max().item() + 1
+  if obj_to_img.numel() == 0:
+      return torch.zeros(0, num_classes, H, W, dtype=dtype, device=device)
+  N = obj_to_img.max().item() + 1
   grid = _boxes_to_grid(boxes, H, W)
   mask_sampled = F.grid_sample(masks.float().view(O, 1, M, M), grid)
   seg = torch.zeros((N,num_classes,H,W)).to(device)
   # obj_to_img_list = [i.item() for i in list(obj_to_img)]
   for i in range(N):
-    obj_to_i = (obj_to_img==i).nonzero().view(-1)
+    obj_to_i = (obj_to_img==i).nonzero(as_tuple=False).view(-1)
     # start = obj_to_img_list.index(i)
     # end = len(obj_to_img_list) - obj_to_img_list[::-1].index(i)
     # for j in range(start,end):
@@ -224,7 +228,9 @@ def boxes_to_seg(boxes, objs, obj_to_img, H, W=None,num_classes=15):
   O, D = boxes.size()
   if W is None:
     W = H
-  N = obj_to_img.data.max().item() + 1
+  if obj_to_img.numel() == 0:
+      return torch.zeros(0, num_classes, H, W, dtype=dtype, device=device)
+  N = obj_to_img.max().item() + 1
 
   grid = _boxes_to_grid(boxes, H, W)
   mask_sampled = F.grid_sample(torch.ones(O,1,8,8).to(boxes), grid)

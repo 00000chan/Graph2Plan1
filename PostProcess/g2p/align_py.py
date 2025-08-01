@@ -441,11 +441,71 @@ def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_resu
     print("Step 3: regularize_fp_py complete.")
 
     # --- TODO: Port the rest of the align_fp.m pipeline ---
-    # 4. get_room_boundary_py
+def get_room_boundary_py(box, boundary, order):
+    """
+    Python port of get_room_boundary.m
+    Calculates the final, precise polygonal shape of each room.
+    """
+    from shapely.geometry import Polygon, box as shapely_box
 
-    # For now, return placeholder values
-    num_rooms = new_box.shape[0]
-    r_boundary = np.array([b for b in new_box], dtype=object) # Placeholder
+    is_new = boundary[:, 3]
+    poly_boundary = Polygon(boundary[is_new == 0, :2])
 
-    print("Placeholder: Returning regularized boxes.")
+    room_polys = [shapely_box(b[0], b[1], b[2], b[3]) for b in box]
+
+    new_box = box.copy()
+    r_boundary = [None] * len(box)
+
+    for i in range(len(order)):
+        idx = order[i]
+
+        # Start with the room's polygon, intersected with the main boundary
+        r_poly = poly_boundary.intersection(room_polys[idx])
+
+        # Subtract all rooms that are drawn on top of the current one
+        for j in range(i + 1, len(order)):
+            top_room_idx = order[j]
+            r_poly = r_poly.difference(room_polys[top_room_idx])
+
+        if not r_poly.is_empty:
+            # Store the vertices of the final polygon
+            # Shapely polygons have exterior and interior coordinates. For now, just store exterior.
+            r_boundary[idx] = np.array(r_poly.exterior.coords)
+            # Update the bounding box to match the final polygon's bounds
+            new_box[idx, :] = np.array(r_poly.bounds)
+
+    return new_box, r_boundary
+
+
+def align_fp_py(boundary, r_box, r_type, r_edge, fp_layout, threshold, draw_result=False):
+    """
+    Python port of the main align_fp.m script.
+    This function will orchestrate the alignment process.
+    """
+    print("Running Python-native alignment...")
+
+    # The MATLAB code re-orders edges to process living room last. We replicate this.
+    living_idx = np.where(r_type == 0)[0]
+    if len(living_idx) > 0:
+        living_idx = living_idx[0]
+        is_living_edge = (r_edge[:, 0] == living_idx) | (r_edge[:, 1] == living_idx)
+        r_edge = np.vstack([r_edge[~is_living_edge], r_edge[is_living_edge]])
+
+    # 1. Align with boundary
+    new_box, updated = align_with_boundary_py(r_box.copy(), boundary, threshold, r_type)
+    print("Step 1: align_with_boundary_py complete.")
+
+    # 2. Align with neighbors
+    new_box, updated = align_neighbor_py(new_box, r_edge, updated, threshold)
+    print("Step 2: align_neighbor_py complete.")
+
+    # 3. Regularize floorplan
+    new_box, order = regularize_fp_py(new_box, boundary, r_type)
+    print("Step 3: regularize_fp_py complete.")
+
+    # 4. Get final room boundaries
+    new_box, r_boundary = get_room_boundary_py(new_box, boundary, order)
+    print("Step 4: get_room_boundary_py complete.")
+
+    print("Python-native alignment process finished.")
     return new_box, order, r_boundary

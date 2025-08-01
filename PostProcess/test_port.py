@@ -69,14 +69,48 @@ def main():
     )
 
     # --- Comparison ---
-    # print("\n--- Comparison (to be enabled later) ---")
-    # ground_truth = np.load(ground_truth_path, allow_pickle=True)
-    # print("Comparing box alignment...")
-    # assert np.allclose(ground_truth['newBox'], boxes_py)
-    # print("Comparing room order...")
-    # assert np.array_equal(ground_truth['order'], order_py)
+    print("\n--- Comparing MATLAB and Python outputs ---")
+    ground_truth = np.load(ground_truth_path, allow_pickle=True)
+    python_output = np.load(python_output_path, allow_pickle=True)
 
-    print("\nTest harness setup complete. Ground truth saved.")
+    # 1. Compare final bounding boxes
+    print("Comparing final bounding boxes (newBox)...")
+    try:
+        np.testing.assert_allclose(ground_truth['newBox'], python_output['newBox'], rtol=1e-5, atol=1e-5)
+        print("✅ Bounding boxes are almost equal.")
+    except AssertionError as e:
+        print("❌ Bounding boxes are different.")
+        print(e)
+
+    # 2. Compare room drawing order
+    print("\nComparing room drawing order (order)...")
+    try:
+        np.testing.assert_array_equal(ground_truth['order'], python_output['order'])
+        print("✅ Room orders are equal.")
+    except AssertionError as e:
+        print("❌ Room orders are different.")
+        print(e)
+
+    # 3. Compare final room boundaries (rBoundary)
+    print("\nComparing final room boundaries (rBoundary)...")
+    try:
+        gt_rb = ground_truth['rBoundary']
+        py_rb = python_output['rBoundary']
+        assert len(gt_rb) == len(py_rb), f"Number of boundaries differ: {len(gt_rb)} vs {len(py_rb)}"
+        all_match = True
+        for i in range(len(gt_rb)):
+            if not np.allclose(gt_rb[i], py_rb[i], rtol=1e-5, atol=1e-5):
+                print(f"Mismatch in boundary for room {i}")
+                all_match = False
+        if all_match:
+            print("✅ Room boundaries are almost equal.")
+        else:
+            print("❌ Some room boundaries are different.")
+    except Exception as e:
+        print("❌ Error comparing room boundaries.")
+        print(e)
+
+    print("\nComparison finished.")
 
 
 if __name__ == '__main__':
